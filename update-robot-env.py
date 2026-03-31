@@ -145,10 +145,10 @@ def pull_repo(repo_dir: Path, repo_name: str, token: str) -> None:
 
 def main() -> None:
     script_dir = Path(__file__).parent.resolve()
-    home_dir = script_dir.parent
+    home_dir = Path.home()
     env_file = home_dir / "robot-env" / ".env"
     pem_file = home_dir / "robot-env" / ".github-app.pem"
-    deploy_dir = home_dir / "robot-deploy"
+    deploy_dir = script_dir.parent / "robot-deploy"
 
     check_cmd("git")
     check_cmd("openssl")

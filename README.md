@@ -68,9 +68,9 @@ The script will also look for `.env` and `.github-app.pem` in your current worki
 
 1. Authenticates with GitHub using your App credentials
 2. Clones the necessary repositories:
-    - `5toe5/deploy-script`
-    - `5toe5/robot-deploy`
-    - `5toe5/robot-docs`
+    - `~/deploy-script`
+    - `~/robot-deploy`
+    - `~/robot-docs`
 3. Stores configuration in `~/robot-env/.env` and the private key in `~/robot-env/.github-app.pem` by default
 4. Prompts for deployment choice: sequencer, docs, or both
 5. Runs the deployment script
@@ -89,7 +89,7 @@ Or from a local checkout:
 ./update.sh
 ```
 
-`update.sh` is a small wrapper around the Python updater, so the simplest local command remains `./update.sh`.
+`update.sh` pulls the latest `deploy-script` checkout, then runs the Python updater via `uv run`, so the simplest local command remains `./update.sh`.
 
 If you want to run the Python updater directly:
 
