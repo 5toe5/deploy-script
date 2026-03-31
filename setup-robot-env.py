@@ -14,7 +14,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 DEPLOY_SCRIPT_REPO = "5toe5/deploy-script"
 DEPLOY_REPO = "5toe5/robot-deploy"
@@ -85,7 +85,7 @@ def b64url(data: bytes) -> str:
 
 def generate_jwt(app_id: str, pem_path: str) -> str:
     """Generate a GitHub App JWT."""
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     iat = now - timedelta(seconds=60)
     exp = now + timedelta(minutes=9)
 
