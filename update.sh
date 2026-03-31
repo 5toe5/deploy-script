@@ -20,9 +20,16 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "'$1' is not installed"; 
 
 load_env() {
 	local line key value
+	log "Loading environment from $1"
 	while IFS= read -r line || [[ -n "$line" ]]; do
+		line=${line%$'\r'}
+		line="${line#${line%%[![:space:]]*}}"
 		[[ "$line" =~ ^[[:space:]]*# ]] && continue
 		[[ -z "${line//[[:space:]]/}" ]] && continue
+		if [[ "$line" =~ ^export[[:space:]]+ ]]; then
+			line=${line#export}
+			line="${line#${line%%[![:space:]]*}}"
+		fi
 		key="${line%%=*}"
 		value="${line#*=}"
 		key="${key#${key%%[![:space:]]*}}"
