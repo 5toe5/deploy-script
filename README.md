@@ -83,6 +83,20 @@ After setup, update the local deployment tooling and pull the latest app release
 ~/deploy-script/update.sh
 ```
 
+Or from a local checkout:
+
+```bash
+./update.sh
+```
+
+`update.sh` is a small wrapper around the Python updater, so the simplest local command remains `./update.sh`.
+
+If you want to run the Python updater directly:
+
+```bash
+uv run update-robot-env.py
+```
+
 This script:
 
 1. Authenticates with the GitHub App
