@@ -1,300 +1,383 @@
 #!/usr/bin/env python3
-# /// script
-# dependencies = []
-# ///
-"""Setup script for robot deployment environment."""
+"""Bootstrap a fresh Granforge host using only the Python standard library."""
 
+import argparse
+import ipaddress
 import os
-import sys
-import json
-import base64
-import shutil
+import re
 import socket
-import subprocess
-import urllib.request
-import urllib.error
+import stat
+import sys
+import tempfile
 from pathlib import Path
-from datetime import UTC, datetime, timedelta
 
-DEPLOY_SCRIPT_REPO = "5toe5/deploy-script"
-DEPLOY_REPO = "5toe5/robot-deploy"
-DOCS_REPO = "5toe5/robot-docs"
+import setup_robot_env_support as support
 
 
-def log(msg: str) -> None:
-    """Print a log message."""
-    print(f"[setup] {msg}", file=sys.stderr)
+PRIVATE_REPO = "5toe5/robot-deploy"
+PUBLIC_REMOTE = f"https://github.com/{PRIVATE_REPO}.git"
+SEMVER = support.SEMVER
+PACKAGES = ("git", "openssl", "systemd")
+COMMANDS = {"systemd": "systemctl"}
 
 
-def die(msg: str) -> None:
-    """Print an error and exit."""
-    print(f"[setup] ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
+BootstrapError = support.BootstrapError
+CommandRunner = support.CommandRunner
 
 
-def prompt(label: str, default: str = "", env_var: str = "") -> str:
-    """Prompt for input, checking environment first."""
-    if env_var and env_var in os.environ:
-        value = os.environ[env_var]
-        log(f"Using {env_var} from environment")
-        return value
-
-    if default:
-        prompt_text = f"{label} [{default}]: "
-    else:
-        prompt_text = f"{label}: "
-
-    try:
-        value = input(prompt_text).strip()
-    except EOFError:
-        value = ""
-
-    return value if value else default
+def log(message):
+    print(f"[setup] {message}", file=sys.stderr)
 
 
-def check_cmd(cmd: str) -> None:
-    """Verify a command exists."""
-    if shutil.which(cmd) is None:
-        die(f"'{cmd}' is not installed")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--version")
+    parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--github-app-id")
+    parser.add_argument("--github-installation-id")
+    parser.add_argument("--pem-file", type=Path)
+    parser.add_argument("--motion-agent-agent-host")
+    parser.add_argument("--simulator-only", action="store_true")
+    return parser.parse_args(argv)
 
 
-def require_value(label: str, value: str) -> str:
-    """Ensure a required configuration value is present."""
-    if not value:
-        die(f"{label} is required")
-    return value
-
-
-def detect_agent_host() -> str:
-    """Detect the LAN IP robots should use to reach the agent."""
+def detect_lan_address():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("1.1.1.1", 80))
-            host = sock.getsockname()[0]
-            if host:
-                return host
+            return sock.getsockname()[0]
     except OSError:
-        pass
-    return "127.0.0.1"
+        return ""
 
 
-def b64url(data: bytes) -> str:
-    """Base64 URL-safe encoding without padding."""
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def ask(input_fn, label, default=""):
+    suffix = f" [{default}]" if default else ""
+    value = input_fn(f"{label}{suffix}: ").strip()
+    return value or default
 
 
-def generate_jwt(app_id: str, pem_path: str) -> str:
-    """Generate a GitHub App JWT."""
-    now = datetime.now(UTC)
-    iat = now - timedelta(seconds=60)
-    exp = now + timedelta(minutes=9)
-
-    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
-    payload = b64url(
-        json.dumps(
-            {"iat": int(iat.timestamp()), "exp": int(exp.timestamp()), "iss": app_id}
-        ).encode()
-    )
-
-    to_sign = f"{header}.{payload}".encode()
-
-    # Sign with OpenSSL
-    result = subprocess.run(
-        ["openssl", "dgst", "-sha256", "-sign", pem_path],
-        input=to_sign,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        die(f"Failed to sign JWT: {result.stderr.decode()}")
-
-    sig = b64url(result.stdout)
-    return f"{header}.{payload}.{sig}"
+def validate_persisted(name, value, numeric=False):
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise BootstrapError(f"{name} must not contain control characters")
+    if numeric and not re.fullmatch(r"[0-9]+", value):
+        raise BootstrapError(f"{name} must be numeric")
+    if not numeric and not re.fullmatch(r"[A-Za-z0-9._:%-]+", value):
+        raise BootstrapError(f"{name} contains unsafe characters")
 
 
-def get_installation_token(jwt: str, installation_id: str):
-    """Get an installation access token."""
-    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
-    req = urllib.request.Request(
-        url,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {jwt}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-
+def validate_agent_host(host, simulator_only):
     try:
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read())
-            return data["token"]
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode()
-        die(f"GitHub API error: {e.code} - {error_body}")
-    except Exception as e:
-        die(f"Failed to get installation token: {e}")
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise BootstrapError(
+            "MOTION_AGENT_AGENT_HOST must be a concrete IP address"
+        ) from error
+    mapped = getattr(address, "ipv4_mapped", None)
+    effective = mapped if mapped is not None else address
+    if effective.is_unspecified or effective.is_multicast:
+        raise BootstrapError(
+            "MOTION_AGENT_AGENT_HOST must be a usable unicast IP address"
+        )
+    loopback = address.is_loopback or effective.is_loopback
+    if loopback and not simulator_only:
+        raise BootstrapError(
+            "loopback MOTION_AGENT_AGENT_HOST requires --simulator-only"
+        )
 
 
-def clone_repo(repo: str, dest: str, token: str) -> None:
-    """Clone a repository using the installation token."""
-    dest_path = Path(dest)
-    if dest_path.exists():
-        git_dir = dest_path / ".git"
-        if git_dir.exists():
-            log(f"{dest} already exists, skipping clone")
-            return
-        die(f"{dest} exists but is not a git repository")
-
-    clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
-    result = subprocess.run(["git", "clone", clone_url, dest])
-    if result.returncode != 0:
-        die(f"Failed to clone {repo}")
-
-    # Update remote URL to remove token
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            dest,
-            "remote",
-            "set-url",
-            "origin",
-            f"https://github.com/{repo}.git",
-        ],
-        capture_output=True,
-    )
+def serialize_env(values):
+    lines = []
+    for name, value in values.items():
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            raise BootstrapError(f"invalid environment key: {name}")
+        validate_persisted(name, value, numeric=name in {
+            "GITHUB_APP_ID", "GITHUB_INSTALLATION_ID"
+        })
+        lines.append(f"{name}={value}\n")
+    return "".join(lines)
 
 
-def load_local_env(script_dir: Path) -> None:
-    """Load .env and PEM from script directory or current working directory."""
-    # Check both script directory and current working directory
-    search_dirs = [Path.cwd(), script_dir]
-
-    # First pass: find .env files
-    for search_dir in search_dirs:
-        env_path = search_dir / ".env"
-        if env_path.exists():
-            log(f"Loading environment from {env_path}")
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        # Remove quotes if present
-                        if (value.startswith('"') and value.endswith('"')) or (
-                            value.startswith("'") and value.endswith("'")
-                        ):
-                            value = value[1:-1]
-                        if key not in os.environ:
-                            os.environ[key] = value
-
-    # Second pass: find PEM file (prefer current directory)
-    for search_dir in search_dirs:
-        pem_path = search_dir / ".github-app.pem"
-        if pem_path.exists() and "PEM_FILE" not in os.environ:
-            log(f"Found PEM file at {pem_path}")
-            os.environ["PEM_FILE"] = str(pem_path)
-            break
+def os_family(root):
+    release = root / "etc/os-release"
+    if not release.is_file():
+        raise BootstrapError(f"cannot detect Linux distribution: missing {release}")
+    values = {}
+    for raw_line in release.read_text().splitlines():
+        if "=" in raw_line:
+            key, value = raw_line.split("=", 1)
+            values[key] = value.strip().strip('"')
+    names = {values.get("ID", ""), *values.get("ID_LIKE", "").split()}
+    if names & {"debian", "ubuntu", "raspbian"}:
+        return "debian"
+    if names & {"arch"}:
+        return "arch"
+    raise BootstrapError("supported distributions are Debian, Ubuntu, Raspberry Pi OS, and Arch")
 
 
-def main():
-    # Get script directory for loading local files
-    script_dir = Path(__file__).parent.resolve()
-    load_local_env(script_dir)
-
-    # Check dependencies
-    check_cmd("openssl")
-    check_cmd("git")
-
-    # Setup paths
-    env_dir = Path.home() / "robot-env"
-    env_file = env_dir / ".env"
-    pem_file = Path(os.environ.get("PEM_FILE", env_dir / ".github-app.pem"))
-
-    # Create env directory with proper permissions
-    os.umask(0o077)
-    env_dir.mkdir(parents=True, exist_ok=True)
-    env_dir.chmod(0o700)
-    pem_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Get configuration
-    github_app_id = require_value(
-        "GitHub App ID", prompt("GitHub App ID", env_var="GITHUB_APP_ID")
-    )
-    github_installation_id = require_value(
-        "GitHub Installation ID",
-        prompt("GitHub Installation ID", env_var="GITHUB_INSTALLATION_ID"),
-    )
-    agent_host = prompt(
-        "Agent host (LAN IP robots use to reach this device)",
-        detect_agent_host(),
-        "AGENT_HOST",
-    )
-
-    # Handle PEM file
-    log(f"Checking for PEM file at: {pem_file}")
-    log(f"PEM file exists: {pem_file.exists()}")
-    if pem_file.exists() and pem_file.stat().st_size > 0:
-        log(f"PEM file already exists at {pem_file}, skipping key input")
+def ensure_prerequisites(root, non_interactive, input_fn, runner):
+    missing = [package for package in PACKAGES if not runner.which(COMMANDS.get(package, package))]
+    if not missing:
+        return
+    family = os_family(root)
+    if family == "debian":
+        command = ["apt-get", "install", "-y", *missing]
+        display = "apt-get update && " + " ".join(command)
+        commands = [["apt-get", "update"], command]
     else:
-        log("\nPaste the GitHub App private key (PEM), then press Ctrl-D:")
-        pem_content = sys.stdin.read()
-        if not pem_content.strip():
-            die("GitHub App private key is required")
-        pem_file.write_text(pem_content)
-        if not pem_content.endswith("\n"):
-            with open(pem_file, "a") as f:
-                f.write("\n")
-    pem_file.chmod(0o600)
+        command = ["pacman", "-S", "--needed", "--noconfirm", *missing]
+        display = " ".join(command)
+        commands = [command]
+    log(f"Required package command: {display}")
+    if non_interactive:
+        raise BootstrapError("non-interactive bootstrap requires all prerequisite packages already installed")
+    if ask(input_fn, "Run this package command? (yes/no)", "no").lower() != "yes":
+        raise BootstrapError("package installation declined")
+    for package_command in commands:
+        result = runner.run(package_command)
+        if result.returncode:
+            raise BootstrapError("package installation failed")
 
-    # Write environment file
-    env_file.write_text(f"""GITHUB_APP_ID='{github_app_id}'
-GITHUB_INSTALLATION_ID='{github_installation_id}'
-AGENT_HOST='{agent_host}'
-""")
-    env_file.chmod(0o600)
 
-    # Authenticate with GitHub
-    log("Authenticating as GitHub App...")
-    jwt = generate_jwt(github_app_id, str(pem_file))
-    token = get_installation_token(jwt, github_installation_id)
-    log("Successfully obtained GitHub installation token")
-
-    # Clone repositories
-    log("Cloning repos...")
-    clone_repo(DEPLOY_SCRIPT_REPO, str(Path.home() / "deploy-script"), token)
-    clone_repo(DEPLOY_REPO, str(Path.home() / "robot-deploy"), token)
-    clone_repo(DOCS_REPO, str(Path.home() / "robot-docs"), token)
-
-    # Prompt for deployment choice
-    print("\nDeploy: [s]equencer / [d]ocs / [b]oth? ", end="")
+def write_private_temp(directory, prefix, content):
+    descriptor, name = tempfile.mkstemp(dir=directory, prefix=prefix)
     try:
-        choice = input().strip().lower()
-    except EOFError:
-        choice = "b"
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w") as private_file:
+            descriptor = -1
+            private_file.write(content)
+            private_file.flush()
+            os.fsync(private_file.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return Path(name)
 
-    flag_map = {
-        "s": "--sequencer",
-        "sequencer": "--sequencer",
-        "d": "--docs",
-        "docs": "--docs",
-        "b": "--both",
-        "both": "--both",
-    }
 
-    if choice not in flag_map:
-        die(f"Invalid choice: {choice}")
+def read_pem_nofollow(path):
+    content = support.read_secure_file(path)
+    if not content.strip():
+        raise BootstrapError(f"GitHub App private key is empty: {path}")
+    return content
 
-    # Execute deploy script
-    deploy_script = Path.home() / "robot-deploy" / "deploy.sh"
-    if not deploy_script.exists():
-        die(f"Deploy script not found: {deploy_script}")
-    if not os.access(deploy_script, os.X_OK):
-        die(f"Deploy script is not executable: {deploy_script}")
-    os.execv(str(deploy_script), [str(deploy_script), flag_map[choice]])
+
+def install_credentials(
+    env_file,
+    pem_file,
+    env_content,
+    pem_content,
+    replace_fn=os.replace,
+    expected_owner=None,
+):
+    directory = env_file.parent
+    if pem_file.parent != directory:
+        raise BootstrapError("credential files must share one directory")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.is_symlink() or not directory.is_dir():
+        raise BootstrapError(f"credential directory is not a real directory: {directory}")
+    directory.chmod(0o700)
+
+    expected_owner = os.geteuid() if expected_owner is None else expected_owner
+    metadata = []
+    for path in (env_file, pem_file):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None and (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != expected_owner
+        ):
+            raise BootstrapError(
+                f"installed credential must have the expected owner and mode 0600: {path}"
+            )
+        metadata.append(info)
+    if (metadata[0] is None) != (metadata[1] is None):
+        raise BootstrapError("installed deployment credentials are an incomplete pair")
+
+    env_temp = None
+    pem_temp = None
+    backups = []
+    replaced = 0
+    try:
+        env_temp = write_private_temp(directory, ".deploy.env.", env_content)
+        pem_temp = write_private_temp(directory, ".github-app.pem.", pem_content)
+        if metadata[0] is not None:
+            for path in (env_file, pem_file):
+                descriptor, backup_name = tempfile.mkstemp(
+                    dir=directory, prefix=f".{path.name}.backup."
+                )
+                os.close(descriptor)
+                os.unlink(backup_name)
+                os.link(path, backup_name, follow_symlinks=False)
+                backups.append(Path(backup_name))
+        replace_fn(env_temp, env_file)
+        replaced = 1
+        env_temp = None
+        replace_fn(pem_temp, pem_file)
+        replaced = 2
+        pem_temp = None
+    except OSError as error:
+        if len(backups) == 2 and replaced:
+            os.replace(backups[0], env_file)
+            os.replace(backups[1], pem_file)
+            backups = []
+        elif not backups and replaced:
+            for path in (env_file, pem_file):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        raise BootstrapError("failed to atomically install deployment credentials") from error
+    finally:
+        for path in (env_temp, pem_temp, *backups):
+            if path is not None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+
+def clone_private_repo(destination, token, runner):
+    if destination.exists() and not (destination / ".git").is_dir():
+        raise BootstrapError(f"{destination} exists but is not a git repository")
+    if not destination.exists():
+        result = support.git_run(
+            runner,
+            ["clone", PUBLIC_REMOTE, str(destination)],
+            token=token,
+        )
+        if result.returncode:
+            raise BootstrapError("failed to clone private robot-deploy repository")
+    refresh_private_repo(destination, token, runner)
+
+
+def refresh_private_repo(destination, token, runner):
+    if not (destination / ".git").is_dir():
+        raise BootstrapError(f"{destination} is not a git repository")
+    support.refresh_main_checkout(destination, PRIVATE_REPO, runner, token)
+
+
+def collect_config(args, environ, input_fn):
+    app_id = args.github_app_id or environ.get("GITHUB_APP_ID", "").strip()
+    installation_id = args.github_installation_id or environ.get("GITHUB_INSTALLATION_ID", "").strip()
+    pem_file = args.pem_file
+    if pem_file is None and environ.get("GITHUB_APP_PEM_FILE"):
+        pem_file = Path(environ["GITHUB_APP_PEM_FILE"])
+    host = args.motion_agent_agent_host or environ.get("MOTION_AGENT_AGENT_HOST", "").strip()
+
+    if not args.non_interactive:
+        app_id = app_id or ask(input_fn, "GitHub App ID")
+        installation_id = installation_id or ask(input_fn, "GitHub App installation ID")
+        pem_file = pem_file or Path(ask(input_fn, "Path to GitHub App private key (PEM)"))
+        host = ask(input_fn, "MOTION_AGENT_AGENT_HOST (confirm LAN address)", host or detect_lan_address())
+        if args.version is None:
+            args.version = ask(input_fn, "Release version (blank lets robot-deploy offer tag/latest)")
+
+    missing = []
+    if not app_id:
+        missing.append("GITHUB_APP_ID is required")
+    if not installation_id:
+        missing.append("GITHUB_INSTALLATION_ID is required")
+    if pem_file is None:
+        missing.append("--pem-file is required")
+    if not host:
+        missing.append("MOTION_AGENT_AGENT_HOST is required")
+    if args.non_interactive and not args.version:
+        missing.append("--version is required")
+    if missing:
+        raise BootstrapError("; ".join(missing))
+    validate_persisted("GITHUB_APP_ID", app_id, numeric=True)
+    validate_persisted("GITHUB_INSTALLATION_ID", installation_id, numeric=True)
+    validate_persisted("MOTION_AGENT_AGENT_HOST", host)
+    if args.version and not SEMVER.fullmatch(args.version):
+        raise BootstrapError(
+            "--version must be an explicit SemVer tag such as v1.2.3 or v1.2.3-rc.1"
+        )
+    if args.bundle and not args.version:
+        raise BootstrapError("--bundle requires an explicit SemVer --version tag")
+    validate_agent_host(host, args.simulator_only)
+    if pem_file.is_symlink() or not pem_file.is_file():
+        raise BootstrapError(f"GitHub App private key is missing or unsafe: {pem_file}")
+    return app_id, installation_id, pem_file, host
+
+
+def main(
+    argv=None,
+    *,
+    runner=None,
+    token_provider=None,
+    environ=None,
+    input_fn=input,
+    sandbox_root=None,
+):
+    args = parse_args(argv)
+    root = Path("/") if sandbox_root is None else Path(sandbox_root)
+    runner = runner or CommandRunner()
+    environ = os.environ if environ is None else environ
+    token_provider = token_provider or support.installation_token
+    try:
+        app_id, installation_id, pem_source, host = collect_config(args, environ, input_fn)
+        if sandbox_root is None and os.geteuid() != 0:
+            raise BootstrapError("run bootstrap as root (for example, sudo python3 setup-robot-env.py)")
+        ensure_prerequisites(root, args.non_interactive, input_fn, runner)
+
+        pem_content = read_pem_nofollow(pem_source)
+        log("Authenticating as read-only GitHub App...")
+        token = token_provider(app_id, installation_id, pem_content, runner)
+        etc_dir = root / "etc/granforge"
+        env_file = etc_dir / "deploy.env"
+        pem_file = etc_dir / "github-app.pem"
+        install_credentials(
+            env_file,
+            pem_file,
+            serialize_env({
+                "GITHUB_APP_ID": app_id,
+                "GITHUB_INSTALLATION_ID": installation_id,
+                "MOTION_AGENT_AGENT_HOST": host,
+            }),
+            pem_content.decode("utf-8"),
+            expected_owner=os.geteuid() if sandbox_root is not None else 0,
+        )
+        deploy_dir = root / "opt/granforge/robot-deploy"
+        deploy_dir.parent.mkdir(parents=True, exist_ok=True)
+        if deploy_dir.exists():
+            refresh_private_repo(deploy_dir, token, runner)
+        else:
+            clone_private_repo(deploy_dir, token, runner)
+
+        deploy_script = deploy_dir / "deploy.sh"
+        command = [str(deploy_script)]
+        if args.version:
+            command.extend(["--version", args.version])
+        if args.bundle:
+            command.extend(["--bundle", str(args.bundle)])
+        deploy_environ = dict(environ)
+        for name in (
+            "GITHUB_APP_ID",
+            "GITHUB_INSTALLATION_ID",
+            "GITHUB_APP_PEM_FILE",
+            "GITHUB_APP_PEM",
+            "PEM_FILE",
+            "GRANFORGE_ROOT",
+            "GRANFORGE_ARCH",
+            "GRANFORGE_SYSTEMCTL",
+            "GRANFORGE_HEALTHCHECK",
+            "GRANFORGE_TEST_FAIL_POINT",
+            "GRANFORGE_BOOTSTRAP_REEXEC",
+        ):
+            deploy_environ.pop(name, None)
+        deploy_environ["MOTION_AGENT_AGENT_HOST"] = host
+        if sandbox_root is not None:
+            deploy_environ["GRANFORGE_ROOT"] = str(root)
+        log("Handing off installation to robot-deploy...")
+        runner.exec(command, deploy_environ)
+        return 0
+    except BootstrapError as error:
+        print(f"[setup] ERROR: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

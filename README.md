@@ -1,110 +1,100 @@
-# deploy-script
+# Granforge fresh-machine bootstrap
 
-One-time bootstrap for a fresh device.
+This public repository is the sole fresh-machine bootstrap for Granforge. It
+installs prerequisites with approval, stores deployment-only GitHub App
+credentials, clones the private `5toe5/robot-deploy` repository, and hands off
+release installation. Runtime configuration and services are owned by
+`robot-deploy`.
 
-## Setup
-## Quick Start
+## Safe fresh-machine flow
 
-### Option 1: Run with uv (recommended)
-
-Create a `.env` file in the same directory as the script:
-
-```bash
-GITHUB_APP_ID='your-app-id'
-GITHUB_INSTALLATION_ID='your-installation-id'
-AGENT_HOST='192.168.1.100'
-```
-
-And place your `.github-app.pem` file in the same directory.
-
-Then run:
+Install system Python 3, clone this repository over HTTPS, review it, and run the
+checked-out script locally:
 
 ```bash
-uv run --python 3.11 https://raw.githubusercontent.com/5toe5/deploy-script/main/setup-robot-env.py
+git clone https://github.com/5toe5/deploy-script.git
+cd deploy-script
+git pull --ff-only
+sudo python3 setup-robot-env.py
 ```
 
-Or if you have the files locally:
+Do not use curl-pipe commands. No `uv` or third-party Python package is needed.
+
+The interactive bootstrap:
+
+1. detects Debian, Ubuntu, Raspberry Pi OS, or Arch;
+2. shows the exact package-manager command and asks before installing missing
+   `git`, `openssl`, or `systemd` tools required by the current deployer;
+3. asks for a read-only GitHub App ID, installation ID, and PEM path;
+4. suggests a detected LAN IP for `MOTION_AGENT_AGENT_HOST` and requires you to
+   confirm a concrete IP address; and
+5. accepts an explicit SemVer tag such as `vX.Y.Z`, `vX.Y.Z-rc.1`, or
+   `vX.Y.Z-rc.1+build.5`, or lets you leave it blank so `robot-deploy` can offer
+   a tag or latest release interactively.
+
+Hostnames are not accepted. Loopback IPs, including IPv4-mapped IPv6 loopback,
+are rejected unless `--simulator-only` is explicitly supplied. Unspecified and
+multicast addresses, including IPv4-mapped forms, are always rejected.
+
+## Unattended bootstrap
+
+All prerequisites must already be installed. Supply every value and an explicit
+SemVer tag:
 
 ```bash
-uv run setup-robot-env.py
+sudo python3 setup-robot-env.py \
+  --non-interactive \
+  --github-app-id 12345 \
+  --github-installation-id 67890 \
+  --pem-file /secure/input/granforge-read-only.pem \
+  --motion-agent-agent-host 192.0.2.10 \
+  --version v1.2.3
 ```
 
-### Option 2: Run locally
-You will be prompted for:
-- GitHub App ID
-- GitHub Installation ID
-- Agent host (LAN IP robots use to reach this device; auto-detected by default)
-- GitHub App private key (PEM)
+The current deployer also accepts a local release bundle and adjacent checksum:
 
-The script will then clone the necessary repos and ask whether to deploy the sequencer, docs, or both.
+```bash
+sudo python3 setup-robot-env.py [credential and host options] \
+  --version v1.2.3 --bundle ./granforge-linux-amd64.tar.gz
+```
 
-## Configuration
+The bootstrap writes root-only files:
 
-The script looks for configuration in this order:
-1. Environment variables (highest priority)
-2. `.env` file in the current working directory
-3. `.env` file in the script's directory
-4. Interactive prompts (fallback)
+- `/etc/granforge/deploy.env` — App/installation IDs and the initial
+  `MOTION_AGENT_AGENT_HOST` for first install;
+- `/etc/granforge/github-app.pem` — the private key; and
+- `/opt/granforge/robot-deploy` — private deployment tooling with a sanitized
+  public-form remote URL.
 
-### Environment Variables
-
-- `GITHUB_APP_ID` - Your GitHub App ID
-- `GITHUB_INSTALLATION_ID` - Your GitHub App Installation ID  
-- `AGENT_HOST` - LAN IP robots use to reach the agent (default: auto-detected, fallback `127.0.0.1`)
-- `PEM_FILE` - Path to your GitHub App private key (default: `~/.robot-env/.github-app.pem` or `./.github-app.pem`)
-
-`GITHUB_APP_ID` and `GITHUB_INSTALLATION_ID` are required. If they are not set in the environment or a local `.env` file, the script will prompt for them.
-
-`AGENT_HOST` is still needed even when the web app and the agent run on the same machine. The sequencer talks to the agent over localhost, but the robot must dial back to the agent over the network for ring-buffer playback, so it needs a reachable LAN IP or hostname.
-
-### Files
-
-- `.env` - Environment variables file
-- `.github-app.pem` - GitHub App private key
-
-The script will also look for `.env` and `.github-app.pem` in your current working directory before falling back to the script directory.
-
-## What It Does
-
-1. Authenticates with GitHub using your App credentials
-2. Clones the necessary repositories:
-    - `~/deploy-script`
-    - `~/robot-deploy`
-    - `~/robot-docs`
-3. Stores configuration in `~/robot-env/.env` and the private key in `~/robot-env/.github-app.pem` by default
-4. Prompts for deployment choice: sequencer, docs, or both
-5. Runs the deployment script
+The short-lived installation token is never written to disk. Deployment
+credentials are authenticated before replacing an existing credential pair and
+are not forwarded in the runtime process environment.
 
 ## Updating
 
-After setup, update the local deployment tooling and pull the latest app release with:
+Run from the public checkout:
 
 ```bash
-~/deploy-script/update.sh
+sudo ./update.sh --version v1.2.4
+sudo ./update.sh --version v1.2.4 --bundle ./granforge-linux-amd64.tar.gz
 ```
 
-Or from a local checkout:
+This requires clean public and private repositories, pulls both with
+`--ff-only`, re-executes the public updater once only when that pull changes its
+HEAD, and forwards `--version` and optional `--bundle` to
+`/opt/granforge/robot-deploy/update.sh`. With a terminal, omitting `--version`
+allows `robot-deploy` to offer tag/latest. Without a terminal, an explicit
+version is mandatory; latest is never selected implicitly.
+
+When invoked with `sudo`, the updater validates `SUDO_UID`/`SUDO_GID` against
+the public checkout owner and marks only that exact checkout as a command-scoped
+Git `safe.directory`; it never changes global Git configuration.
+
+## Tests
 
 ```bash
-./update.sh
+make test
 ```
 
-`update.sh` pulls the latest `deploy-script` checkout, then runs the Python updater via `uv run`, so the simplest local command remains `./update.sh`.
-
-If you want to run the Python updater directly:
-
-```bash
-uv run update-robot-env.py
-```
-
-This script:
-
-1. Authenticates with the GitHub App
-2. Pulls the latest `deploy-script` and `robot-deploy` repositories
-3. Runs `~/robot-deploy/update.sh` to install the latest sequencer release
-
-## Notes
-
-- Existing clone directories are reused only if they are already git repositories.
-- The script writes `~/robot-env` with restricted permissions and keeps the PEM and `.env` files private.
-- If `PEM_FILE` points somewhere else, its parent directory will be created automatically.
+Tests use temporary roots and command/token seams; they do not run sudo, package
+managers, network calls, or touch real `/etc` or `/opt`.

@@ -1,185 +1,176 @@
 #!/usr/bin/env python3
-"""Update deploy tooling and install the latest app release."""
+"""Refresh bootstrap/deployer repositories, then hand off release updating."""
 
-import base64
-import json
+import argparse
 import os
-import shutil
-import subprocess
 import sys
-import urllib.error
-import urllib.request
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-DEPLOY_SCRIPT_REPO = "5toe5/deploy-script"
-DEPLOY_REPO = "5toe5/robot-deploy"
+import setup_robot_env_support as support
 
 
-def log(msg: str) -> None:
-    print(f"[update] {msg}", file=sys.stderr)
+PRIVATE_REPO = "5toe5/robot-deploy"
 
 
-def die(msg: str) -> None:
-    print(f"[update] ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
+def log(message):
+    print(f"[update] {message}", file=sys.stderr)
 
 
-def check_cmd(cmd: str) -> None:
-    if shutil.which(cmd) is None:
-        die(f"'{cmd}' is not installed")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version")
+    parser.add_argument("--bundle", type=Path)
+    return parser.parse_args(argv)
 
 
-def load_env(env_path: Path) -> None:
-    log(f"Loading environment from {env_path}")
-    with env_path.open(encoding="utf-8-sig") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[7:].lstrip()
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if not key or key in os.environ:
-                continue
-            if (value.startswith('"') and value.endswith('"')) or (
-                value.startswith("'") and value.endswith("'")
-            ):
-                value = value[1:-1]
-            os.environ[key] = value
+def deployer_args(args):
+    forwarded = []
+    if args.version:
+        forwarded.extend(["--version", args.version])
+    if args.bundle:
+        forwarded.extend(["--bundle", str(args.bundle)])
+    return forwarded
 
 
-def require_value(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        die(f"{name} not set in ~/robot-env/.env")
-    return value
+def read_env(content):
+    values = {}
+    if isinstance(content, bytes):
+        content = content.decode("utf-8-sig")
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
 
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def read_credential(path, sandbox=False):
+    expected_owner = os.geteuid() if sandbox else 0
+    return support.read_secure_file(path, expected_uid=expected_owner, exact_mode=0o600)
 
 
-def generate_jwt(app_id: str, pem_path: str) -> str:
-    now = datetime.now(UTC)
-    iat = now - timedelta(seconds=60)
-    exp = now + timedelta(minutes=9)
-
-    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
-    payload = b64url(
-        json.dumps(
-            {"iat": int(iat.timestamp()), "exp": int(exp.timestamp()), "iss": app_id}
-        ).encode()
-    )
-
-    result = subprocess.run(
-        ["openssl", "dgst", "-sha256", "-sign", pem_path],
-        input=f"{header}.{payload}".encode(),
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        die(f"Failed to sign JWT: {result.stderr.decode().strip()}")
-
-    return f"{header}.{payload}.{b64url(result.stdout)}"
+def validate_credential(path, sandbox=False):
+    read_credential(path, sandbox)
 
 
-def get_installation_token(jwt: str, installation_id: str) -> str:
-    req = urllib.request.Request(
-        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {jwt}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+def main(
+    argv=None,
+    *,
+    script_dir=None,
+    runner=None,
+    token_provider=None,
+    environ=None,
+    interactive=None,
+    sandbox_root=None,
+    effective_uid=None,
+):
+    args = parse_args(argv)
+    root = Path("/") if sandbox_root is None else Path(sandbox_root)
+    runner = runner or support.CommandRunner()
+    token_provider = token_provider or support.installation_token
+    environ = os.environ if environ is None else environ
+    script_dir = Path(__file__).resolve().parent if script_dir is None else Path(script_dir)
+    interactive = sys.stdin.isatty() if interactive is None else interactive
+    effective_uid = os.geteuid() if effective_uid is None else effective_uid
     try:
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read())
-    except urllib.error.HTTPError as e:
-        die(f"GitHub API error: {e.code} - {e.read().decode()}")
-    except Exception as e:
-        die(f"Failed to get installation token: {e}")
+        if not args.version and not interactive:
+            raise support.BootstrapError(
+                "non-interactive update requires an explicit SemVer --version tag; latest is never implicit"
+            )
+        if args.version and not support.SEMVER.fullmatch(args.version):
+            raise support.BootstrapError(
+                "--version must be an explicit SemVer tag such as v1.2.3 or v1.2.3-rc.1"
+            )
+        if args.bundle and not args.version:
+            raise support.BootstrapError("--bundle requires an explicit SemVer --version tag")
+        if sandbox_root is None and effective_uid != 0:
+            raise support.BootstrapError("run update as root")
 
-    token = data.get("token", "")
-    if not token:
-        die("Failed to obtain GitHub installation access token")
-    return token
+        env_file = root / "etc/granforge/deploy.env"
+        pem_file = root / "etc/granforge/github-app.pem"
+        sandbox = sandbox_root is not None
+        env_content = read_credential(env_file, sandbox)
+        pem_content = read_credential(pem_file, sandbox)
+        config = read_env(env_content)
+        app_id = config.get("GITHUB_APP_ID", "")
+        installation_id = config.get("GITHUB_INSTALLATION_ID", "")
+        if not app_id or not installation_id:
+            raise support.BootstrapError("deployment credential IDs are incomplete")
+        support.validate_app_ids(app_id, installation_id)
 
+        deploy_dir = root / "opt/granforge/robot-deploy"
+        for checkout in (script_dir, deploy_dir):
+            if not (checkout / ".git").is_dir():
+                raise support.BootstrapError(f"missing git repository: {checkout}")
+        public_git_context = support.checkout_git_context(
+            script_dir, environ, effective_uid
+        )
+        support.verify_main_checkout(deploy_dir, PRIVATE_REPO, runner)
+        log("Pulling public deploy-script with --ff-only...")
+        before, after = support.refresh_main_checkout(
+            script_dir,
+            "5toe5/deploy-script",
+            runner,
+            context=public_git_context,
+        )
+        if before != after:
+            command = [sys.executable, str(script_dir / "update-robot-env.py")]
+            command.extend(deployer_args(args))
+            reexec_env = dict(environ)
+            for name in (
+                "GITHUB_APP_ID",
+                "GITHUB_INSTALLATION_ID",
+                "GITHUB_APP_PEM_FILE",
+                "GITHUB_APP_PEM",
+                "PEM_FILE",
+                "GRANFORGE_ROOT",
+                "GRANFORGE_ARCH",
+                "GRANFORGE_SYSTEMCTL",
+                "GRANFORGE_HEALTHCHECK",
+                "GRANFORGE_TEST_FAIL_POINT",
+                "GRANFORGE_BOOTSTRAP_REEXEC",
+                "SUDO_UID",
+                "SUDO_GID",
+            ):
+                reexec_env.pop(name, None)
+            reexec_env.update(public_git_context["identity"])
+            runner.exec(command, reexec_env)
+            return 0
 
-def ensure_clean_repo(repo_dir: Path) -> None:
-    if not (repo_dir / ".git").exists():
-        die(f"Missing git repository at {repo_dir} - run setup-robot-env.py first")
-    result = subprocess.run(
-        ["git", "-C", str(repo_dir), "status", "--short"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        die(f"Failed to inspect git status for {repo_dir}")
-    if result.stdout.strip():
-        die(f"Repository has local changes: {repo_dir}")
+        log("Authenticating as read-only GitHub App...")
+        token = token_provider(app_id, installation_id, pem_content, runner)
+        log("Pulling private robot-deploy with --ff-only...")
+        support.refresh_main_checkout(deploy_dir, PRIVATE_REPO, runner, token)
 
-
-def pull_repo(repo_dir: Path, repo_name: str, token: str) -> None:
-    ensure_clean_repo(repo_dir)
-    log(f"Pulling latest {repo_name}...")
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_dir),
-            "-c",
-            f"url.https://x-access-token:{token}@github.com/.insteadOf=https://github.com/",
-            "pull",
-            "--ff-only",
-        ]
-    )
-    if result.returncode != 0:
-        die(f"Failed to pull {repo_name}")
-
-
-def main() -> None:
-    script_dir = Path(__file__).parent.resolve()
-    home_dir = Path.home()
-    env_file = home_dir / "robot-env" / ".env"
-    pem_file = home_dir / "robot-env" / ".github-app.pem"
-    deploy_dir = script_dir.parent / "robot-deploy"
-
-    check_cmd("git")
-    check_cmd("openssl")
-
-    if not env_file.exists():
-        die(f"Missing {env_file} - run setup-robot-env.py first")
-    if not pem_file.exists():
-        die(f"Missing {pem_file} - run setup-robot-env.py first")
-    if not deploy_dir.exists():
-        die(f"Missing {deploy_dir} - run setup-robot-env.py first")
-
-    load_env(env_file)
-    github_app_id = require_value("GITHUB_APP_ID")
-    installation_id = require_value("GITHUB_INSTALLATION_ID")
-
-    log("Authenticating as GitHub App...")
-    jwt = generate_jwt(github_app_id, str(pem_file))
-    token = get_installation_token(jwt, installation_id)
-
-    pull_repo(script_dir, DEPLOY_SCRIPT_REPO, token)
-    pull_repo(deploy_dir, DEPLOY_REPO, token)
-
-    deploy_update = deploy_dir / "update.sh"
-    if not deploy_update.exists():
-        die(f"Missing update script: {deploy_update}")
-    if not os.access(deploy_update, os.X_OK):
-        die(f"Update script is not executable: {deploy_update}")
-
-    log("Running robot-deploy update...")
-    os.execv(str(deploy_update), [str(deploy_update)])
+        command = [str(deploy_dir / "update.sh")]
+        command.extend(deployer_args(args))
+        clean_env = dict(environ)
+        for name in (
+            "GITHUB_APP_ID",
+            "GITHUB_INSTALLATION_ID",
+            "GITHUB_APP_PEM_FILE",
+            "GITHUB_APP_PEM",
+            "PEM_FILE",
+            "GRANFORGE_ROOT",
+            "GRANFORGE_ARCH",
+            "GRANFORGE_SYSTEMCTL",
+            "GRANFORGE_HEALTHCHECK",
+            "GRANFORGE_TEST_FAIL_POINT",
+            "SUDO_UID",
+            "SUDO_GID",
+        ):
+            clean_env.pop(name, None)
+        clean_env.pop("GRANFORGE_BOOTSTRAP_REEXEC", None)
+        clean_env.update(public_git_context["identity"])
+        if sandbox_root is not None:
+            clean_env["GRANFORGE_ROOT"] = str(root)
+        runner.exec(command, clean_env)
+        return 0
+    except support.BootstrapError as error:
+        print(f"[update] ERROR: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
