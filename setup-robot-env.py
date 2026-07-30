@@ -36,6 +36,8 @@ def parse_args(argv=None):
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--github-app-id")
     parser.add_argument("--github-installation-id")
+    parser.add_argument("--env", type=Path)
+    parser.add_argument("--pem", type=Path)
     parser.add_argument("--pem-file", type=Path)
     parser.add_argument("--motion-agent-agent-host")
     parser.add_argument("--simulator-only", action="store_true")
@@ -260,14 +262,35 @@ def refresh_private_repo(destination, token, runner):
 
 
 def collect_config(args, environ, input_fn):
-    app_id = args.github_app_id or environ.get("GITHUB_APP_ID", "").strip()
-    installation_id = args.github_installation_id or environ.get("GITHUB_INSTALLATION_ID", "").strip()
-    pem_file = args.pem_file
-    if pem_file is None and environ.get("GITHUB_APP_PEM_FILE"):
-        pem_file = Path(environ["GITHUB_APP_PEM_FILE"])
-    host = args.motion_agent_agent_host or environ.get("MOTION_AGENT_AGENT_HOST", "").strip()
+    if (args.env is None) != (args.pem is None):
+        raise BootstrapError("--env and --pem are required together")
+    env_mode = args.env is not None
+    if env_mode and args.pem_file is not None:
+        raise BootstrapError("--pem and --pem-file cannot be used together")
 
-    if not args.non_interactive:
+    file_values = support.read_env_file(args.env) if env_mode else {}
+    if env_mode:
+        app_id = args.github_app_id if args.github_app_id is not None else file_values.get("GITHUB_APP_ID", "")
+        installation_id = (
+            args.github_installation_id
+            if args.github_installation_id is not None
+            else file_values.get("GITHUB_INSTALLATION_ID", "")
+        )
+        pem_file = args.pem
+        host = (
+            args.motion_agent_agent_host
+            if args.motion_agent_agent_host is not None
+            else file_values.get("MOTION_AGENT_AGENT_HOST", "")
+        )
+    else:
+        app_id = args.github_app_id or environ.get("GITHUB_APP_ID", "").strip()
+        installation_id = args.github_installation_id or environ.get("GITHUB_INSTALLATION_ID", "").strip()
+        pem_file = args.pem_file
+        if pem_file is None and environ.get("GITHUB_APP_PEM_FILE"):
+            pem_file = Path(environ["GITHUB_APP_PEM_FILE"])
+        host = args.motion_agent_agent_host or environ.get("MOTION_AGENT_AGENT_HOST", "").strip()
+
+    if not env_mode and not args.non_interactive:
         app_id = app_id or ask(input_fn, "GitHub App ID")
         installation_id = installation_id or ask(input_fn, "GitHub App installation ID")
         pem_file = pem_file or Path(ask(input_fn, "Path to GitHub App private key (PEM)"))
@@ -284,22 +307,26 @@ def collect_config(args, environ, input_fn):
         missing.append("--pem-file is required")
     if not host:
         missing.append("MOTION_AGENT_AGENT_HOST is required")
-    if args.non_interactive and not args.version:
+    if not env_mode and args.non_interactive and not args.version:
         missing.append("--version is required")
     if missing:
         raise BootstrapError("; ".join(missing))
     validate_persisted("GITHUB_APP_ID", app_id, numeric=True)
     validate_persisted("GITHUB_INSTALLATION_ID", installation_id, numeric=True)
     validate_persisted("MOTION_AGENT_AGENT_HOST", host)
-    if args.version and not SEMVER.fullmatch(args.version):
+    requested_version = args.version
+    if args.bundle and (
+        not requested_version
+        or (env_mode and not SEMVER.fullmatch(requested_version))
+    ):
+        raise BootstrapError("--bundle requires an explicit SemVer --version tag")
+    if requested_version and not SEMVER.fullmatch(requested_version):
         raise BootstrapError(
             "--version must be an explicit SemVer tag such as v1.2.3 or v1.2.3-rc.1"
         )
-    if args.bundle and not args.version:
-        raise BootstrapError("--bundle requires an explicit SemVer --version tag")
+    if env_mode and args.version is None:
+        args.version = "latest"
     validate_agent_host(host, args.simulator_only)
-    if pem_file.is_symlink() or not pem_file.is_file():
-        raise BootstrapError(f"GitHub App private key is missing or unsafe: {pem_file}")
     return app_id, installation_id, pem_file, host
 
 
@@ -321,7 +348,7 @@ def main(
         app_id, installation_id, pem_source, host = collect_config(args, environ, input_fn)
         if sandbox_root is None and os.geteuid() != 0:
             raise BootstrapError("run bootstrap as root (for example, sudo python3 setup-robot-env.py)")
-        ensure_prerequisites(root, args.non_interactive, input_fn, runner)
+        ensure_prerequisites(root, args.non_interactive or args.env is not None, input_fn, runner)
 
         pem_content = read_pem_nofollow(pem_source)
         log("Authenticating as read-only GitHub App...")
@@ -360,6 +387,8 @@ def main(
             "GITHUB_APP_PEM_FILE",
             "GITHUB_APP_PEM",
             "PEM_FILE",
+            "AGENT_HOST",
+            "MOTION_AGENT_AGENT_HOST",
             "GRANFORGE_ROOT",
             "GRANFORGE_ARCH",
             "GRANFORGE_SYSTEMCTL",

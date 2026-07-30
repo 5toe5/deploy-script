@@ -38,18 +38,22 @@ multicast addresses, including IPv4-mapped forms, are always rejected.
 
 ## Unattended bootstrap
 
-All prerequisites must already be installed. Supply every value and an explicit
-SemVer tag:
+From an existing checkout, the canonical non-prompting command is:
 
 ```bash
-sudo python3 setup-robot-env.py \
-  --non-interactive \
-  --github-app-id 12345 \
-  --github-installation-id 67890 \
-  --pem-file /secure/input/granforge-read-only.pem \
-  --motion-agent-agent-host 192.0.2.10 \
-  --version v1.2.3
+sudo python3 setup-robot-env.py --env=/path/to/.env --pem=/path/to/key.pem
 ```
+
+The environment file accepts `GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`, and
+`MOTION_AGENT_AGENT_HOST`; the legacy `AGENT_HOST` name is also accepted and is
+normalized to `MOTION_AGENT_AGENT_HOST`. The latest published release is selected
+by default. Pass `--version v1.2.3` to select an explicit release tag (and do not
+use a bundle without an explicit SemVer tag). CLI configuration options override
+values in the environment file. Input PEM and environment files should be mode
+`0600`.
+
+The existing `--non-interactive` and individual long options, including
+`--pem-file`, remain available for legacy workflows.
 
 The current deployer also accepts a local release bundle and adjacent checksum:
 

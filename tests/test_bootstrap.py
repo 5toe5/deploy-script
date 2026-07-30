@@ -85,6 +85,49 @@ class FakeRunner:
 
 
 class SupportTests(unittest.TestCase):
+    def test_env_file_parser_is_literal_allowlisted_and_normalizes_legacy_host(self):
+        import setup_robot_env_support as support
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "input.env"
+            path.write_bytes(
+                b"\xef\xbb\xbf\n"
+                b"# comment\n"
+                b"export GITHUB_APP_ID = \"123\" # comment\n"
+                b"GITHUB_INSTALLATION_ID=456\n"
+                b"AGENT_HOST='192.0.2.10'\n"
+            )
+            self.assertEqual(
+                support.read_env_file(path),
+                {
+                    "GITHUB_APP_ID": "123",
+                    "GITHUB_INSTALLATION_ID": "456",
+                    "MOTION_AGENT_AGENT_HOST": "192.0.2.10",
+                },
+            )
+
+            for content in (
+                "UNKNOWN=value\n",
+                "GITHUB_APP_ID=1\nGITHUB_APP_ID=2\n",
+                "GITHUB_APP_ID='1\n",
+                "GITHUB_APP_ID=1; echo unsafe\n",
+                "MOTION_AGENT_AGENT_HOST=192.0.2.10\nAGENT_HOST=192.0.2.11\n",
+            ):
+                path.write_text(content)
+                with self.subTest(content=content), self.assertRaises(support.BootstrapError):
+                    support.read_env_file(path)
+
+            path.write_bytes(b"GITHUB_APP_ID=\xff\n")
+            with self.assertRaises(support.BootstrapError):
+                support.read_env_file(path)
+
+            target = Path(root) / "target.env"
+            target.write_text("GITHUB_APP_ID=1\n")
+            path.unlink()
+            path.symlink_to(target)
+            with self.assertRaises(support.BootstrapError):
+                support.read_env_file(path)
+
     def test_sudo_checkout_uses_only_exact_command_scoped_safe_directory(self):
         import setup_robot_env_support as support
 
@@ -264,6 +307,71 @@ class SupportTests(unittest.TestCase):
 
 
 class BootstrapCLITests(unittest.TestCase):
+    def test_env_mode_cli_values_override_file_and_bundle_requires_explicit_semver(self):
+        setup = load_setup()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            env = root_path / "input.env"
+            pem = root_path / "input.pem"
+            env.write_text(
+                "GITHUB_APP_ID=111\n"
+                "GITHUB_INSTALLATION_ID=222\n"
+                "MOTION_AGENT_AGENT_HOST=192.0.2.11\n"
+            )
+            pem.write_text("key\n")
+            args = setup.parse_args([
+                "--env", str(env), "--pem", str(pem),
+                "--github-app-id", "333",
+                "--github-installation-id", "444",
+                "--motion-agent-agent-host", "192.0.2.12",
+                "--version", "v1.2.3",
+            ])
+            self.assertEqual(
+                setup.collect_config(args, {"GITHUB_APP_ID": "999"}, lambda _: "" )[:2],
+                ("333", "444"),
+            )
+            self.assertEqual(setup.collect_config(args, {}, lambda _: "")[3], "192.0.2.12")
+
+            bundle_args = setup.parse_args([
+                "--env", str(env), "--pem", str(pem), "--bundle", "bundle.tar.gz",
+            ])
+            with self.assertRaises(setup.BootstrapError):
+                setup.collect_config(bundle_args, {}, lambda _: "")
+
+            with self.assertRaises(setup.BootstrapError):
+                setup.collect_config(setup.parse_args(["--env", str(env)]), {}, lambda _: "")
+
+    def test_env_pem_mode_reads_legacy_host_and_hands_off_latest_without_prompting(self):
+        setup = load_setup()
+        runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            env = root_path / "input.env"
+            pem = root_path / "input.pem"
+            env.write_bytes(
+                b"\xef\xbb\xbf# deployment credentials\n"
+                b"export GITHUB_APP_ID='123'\n"
+                b"GITHUB_INSTALLATION_ID=456\n"
+                b"AGENT_HOST=192.0.2.10\n"
+            )
+            pem.write_bytes(b"PRIVATE-KEY\n")
+
+            result = setup.main(
+                ["--env", str(env), "--pem", str(pem)],
+                runner=runner,
+                token_provider=lambda *_: "short-lived-token",
+                environ={
+                    "GITHUB_APP_ID": "ambient-wrong",
+                    "MOTION_AGENT_AGENT_HOST": "198.51.100.20",
+                },
+                input_fn=lambda _: (_ for _ in ()).throw(AssertionError("prompted")),
+                sandbox_root=root,
+            )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(runner.exec_command[0][-2:], ["--version", "latest"])
+            self.assertIn("MOTION_AGENT_AGENT_HOST=192.0.2.10", (root_path / "etc/granforge/deploy.env").read_text())
+
     def test_explicit_semver_allows_prerelease_and_build_metadata_but_rejects_near_misses(self):
         setup = load_setup()
         valid = (

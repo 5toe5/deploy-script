@@ -22,6 +22,12 @@ SEMVER = re.compile(
     r"(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
+ENV_KEYS = frozenset({
+    "GITHUB_APP_ID",
+    "GITHUB_INSTALLATION_ID",
+    "MOTION_AGENT_AGENT_HOST",
+    "AGENT_HOST",
+})
 
 
 class BootstrapError(Exception):
@@ -74,6 +80,54 @@ def read_secure_file(path, expected_uid=None, exact_mode=None):
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def read_env_file(path):
+    try:
+        content = read_secure_file(path).decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise BootstrapError(f"environment file is not valid UTF-8: {path}") from error
+    values = {}
+    for line_number, raw_line in enumerate(content.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export") and (
+            len(line) == len("export") or line[len("export")].isspace()
+        ):
+            line = line[len("export"):].lstrip()
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)\s*=\s*(.*)", line)
+        if match is None:
+            raise BootstrapError(f"malformed environment line {line_number}")
+        name, value = match.groups()
+        if name not in ENV_KEYS:
+            raise BootstrapError(f"unknown environment key: {name}")
+        if name in values:
+            raise BootstrapError(f"duplicate environment key: {name}")
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            closing = value.find(quote, 1)
+            trailing = value[closing + 1:].strip() if closing >= 0 else ""
+            if closing < 0 or (trailing and not trailing.startswith("#")):
+                raise BootstrapError(f"malformed environment line {line_number}")
+            value = value[1:closing]
+        else:
+            comment = re.search(r"\s+#", value)
+            if comment:
+                value = value[:comment.start()].rstrip()
+            if any(character in value for character in "'\""):
+                raise BootstrapError(f"malformed environment line {line_number}")
+            if not re.fullmatch(r"[A-Za-z0-9._:%+/@-]*", value):
+                raise BootstrapError(f"malformed environment line {line_number}")
+        values[name] = value
+    current = values.get("MOTION_AGENT_AGENT_HOST")
+    legacy = values.get("AGENT_HOST")
+    if current is not None and legacy is not None and current != legacy:
+        raise BootstrapError("MOTION_AGENT_AGENT_HOST and AGENT_HOST conflict")
+    if current is None and legacy is not None:
+        values["MOTION_AGENT_AGENT_HOST"] = legacy
+    values.pop("AGENT_HOST", None)
+    return values
 
 
 def checkout_git_context(path, environ, effective_uid=None):
