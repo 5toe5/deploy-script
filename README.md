@@ -79,16 +79,17 @@ are not forwarded in the runtime process environment.
 Run from the public checkout:
 
 ```bash
-sudo ./update.sh --version v1.2.4
-sudo ./update.sh --version v1.2.4 --bundle ./granforge-linux-amd64.tar.gz
+sudo ./update.sh
+sudo ./update.sh --release v1.2.4
+sudo ./update.sh --release v1.2.4 --bundle ./granforge-linux-amd64.tar.gz
 ```
 
 This requires clean public and private repositories, pulls both with
 `--ff-only`, re-executes the public updater once only when that pull changes its
-HEAD, and forwards `--version` and optional `--bundle` to
-`/opt/granforge/robot-deploy/update.sh`. With a terminal, omitting `--version`
-allows `robot-deploy` to offer tag/latest. Without a terminal, an explicit
-version is mandatory; latest is never selected implicitly.
+HEAD, and forwards the selected release and optional `--bundle` to
+`/opt/granforge/robot-deploy/update.sh`. With no `--release`, the latest
+published release is selected. Use `--release=v1.2.4` (or the space-separated
+form) to select a specific SemVer tag. Bundles require an explicit release tag.
 
 When invoked with `sudo`, the updater validates `SUDO_UID`/`SUDO_GID` against
 the public checkout owner and marks only that exact checkout as a command-scoped

@@ -18,18 +18,24 @@ def log(message):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version")
+    parser.add_argument("--release", default="latest")
     parser.add_argument("--bundle", type=Path)
     return parser.parse_args(argv)
 
 
-def deployer_args(args):
-    forwarded = []
-    if args.version:
-        forwarded.extend(["--version", args.version])
+def release_args(option, args):
+    forwarded = [option, args.release]
     if args.bundle:
         forwarded.extend(["--bundle", str(args.bundle)])
     return forwarded
+
+
+def deployer_args(args):
+    return release_args("--version", args)
+
+
+def updater_args(args):
+    return release_args("--release", args)
 
 
 def read_env(content):
@@ -71,19 +77,14 @@ def main(
     token_provider = token_provider or support.installation_token
     environ = os.environ if environ is None else environ
     script_dir = Path(__file__).resolve().parent if script_dir is None else Path(script_dir)
-    interactive = sys.stdin.isatty() if interactive is None else interactive
     effective_uid = os.geteuid() if effective_uid is None else effective_uid
     try:
-        if not args.version and not interactive:
+        if args.release != "latest" and not support.SEMVER.fullmatch(args.release):
             raise support.BootstrapError(
-                "non-interactive update requires an explicit SemVer --version tag; latest is never implicit"
+                "--release must be an explicit SemVer tag such as v1.2.3 or v1.2.3-rc.1"
             )
-        if args.version and not support.SEMVER.fullmatch(args.version):
-            raise support.BootstrapError(
-                "--version must be an explicit SemVer tag such as v1.2.3 or v1.2.3-rc.1"
-            )
-        if args.bundle and not args.version:
-            raise support.BootstrapError("--bundle requires an explicit SemVer --version tag")
+        if args.bundle and args.release == "latest":
+            raise support.BootstrapError("--bundle requires an explicit SemVer --release tag")
         if sandbox_root is None and effective_uid != 0:
             raise support.BootstrapError("run update as root")
 
@@ -116,7 +117,7 @@ def main(
         )
         if before != after:
             command = [sys.executable, str(script_dir / "update-robot-env.py")]
-            command.extend(deployer_args(args))
+            command.extend(updater_args(args))
             reexec_env = dict(environ)
             for name in (
                 "GITHUB_APP_ID",

@@ -826,7 +826,7 @@ class UpdateTests(unittest.TestCase):
 
                 with mock.patch.object(update.os, "open", side_effect=open_then_swap):
                     result = update.main(
-                        ["--version", "v1.2.3"],
+                        ["--release", "v1.2.3"],
                         script_dir=public,
                         runner=FakeRunner(),
                         token_provider=authenticate,
@@ -839,12 +839,12 @@ class UpdateTests(unittest.TestCase):
         update = load_update()
         runner = FakeRunner()
         self.assertEqual(
-            update.main(["--version", "v1.2.3-rc.1+build.5"], runner=runner, interactive=False),
+            update.main(["--release", "v1.2.3-rc.1+build.5"], runner=runner, interactive=False),
             1,
         )
         self.assertEqual(runner.commands, [])
         self.assertEqual(
-            update.main(["--version", "v1.2.3-"], runner=FakeRunner(), interactive=False),
+            update.main(["--release", "v1.2.3-"], runner=FakeRunner(), interactive=False),
             1,
         )
     def test_updater_rejects_unrelated_private_repository_before_pulling(self):
@@ -878,7 +878,7 @@ class UpdateTests(unittest.TestCase):
             pem_file.chmod(0o600)
 
             result = update.main(
-                ["--version", "v2.3.4"],
+                ["--release", "v2.3.4"],
                 script_dir=public,
                 runner=runner,
                 token_provider=lambda *_: self.fail("must fail before auth"),
@@ -907,7 +907,7 @@ class UpdateTests(unittest.TestCase):
             pem_file.chmod(0o600)
 
             result = update.main(
-                ["--version", "v2.3.4"],
+                ["--release", "v2.3.4"],
                 script_dir=public,
                 runner=runner,
                 token_provider=lambda *_: self.fail("invalid IDs must not authenticate"),
@@ -980,7 +980,7 @@ class UpdateTests(unittest.TestCase):
 
             first = update.main(
                 [
-                    "--version", "v2.3.4",
+                    "--release", "v2.3.4",
                     "--bundle", str(bundle),
                 ],
                 script_dir=public,
@@ -1003,7 +1003,7 @@ class UpdateTests(unittest.TestCase):
             first_env = runner.exec_command[1]
             second = update.main(
                 [
-                    "--version", "v2.3.4",
+                    "--release", "v2.3.4",
                     "--bundle", str(bundle),
                 ],
                 script_dir=public,
@@ -1039,7 +1039,7 @@ class UpdateTests(unittest.TestCase):
         ):
             self.assertNotIn(hostile, first_env)
         self.assertEqual(first_exec[2:6], [
-            "--version", "v2.3.4", "--bundle", str(bundle)
+            "--release", "v2.3.4", "--bundle", str(bundle)
         ])
         self.assertEqual(
             runner.exec_command[0][-4:],
@@ -1081,7 +1081,7 @@ class UpdateTests(unittest.TestCase):
             (config / "github-app.pem").chmod(0o600)
 
             result = update.main(
-                ["--version", "v2.3.4"],
+                ["--release", "v2.3.4"],
                 script_dir=public,
                 runner=runner,
                 token_provider=lambda *_: "token",
@@ -1120,7 +1120,7 @@ class UpdateTests(unittest.TestCase):
             (config / "github-app.pem").chmod(0o600)
 
             result = update.main(
-                ["--version", "v2.3.4"],
+                ["--release", "v2.3.4"],
                 script_dir=public,
                 runner=runner,
                 token_provider=lambda *_: "token",
@@ -1130,15 +1130,49 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertFalse(any("pull" in command for command in runner.commands))
 
-    def test_noninteractive_update_never_selects_latest_implicitly(self):
+    def test_update_defaults_to_latest_and_accepts_release_override(self):
+        update = load_update()
+
+        self.assertEqual(
+            update.deployer_args(update.parse_args([])),
+            ["--version", "latest"],
+        )
+        self.assertEqual(
+            update.deployer_args(update.parse_args(["--release=v2.3.4"])),
+            ["--version", "v2.3.4"],
+        )
+
+    def test_update_hands_off_latest_when_release_is_omitted(self):
         update = load_update()
         runner = FakeRunner()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            public = root_path / "src/deploy-script"
+            private = root_path / "opt/granforge/robot-deploy"
+            (public / ".git").mkdir(parents=True)
+            (private / ".git").mkdir(parents=True)
+            config = root_path / "etc/granforge"
+            config.mkdir(parents=True)
+            (config / "deploy.env").write_text(
+                "GITHUB_APP_ID=123\nGITHUB_INSTALLATION_ID=456\n"
+            )
+            (config / "github-app.pem").write_text("key\n")
+            (config / "deploy.env").chmod(0o600)
+            (config / "github-app.pem").chmod(0o600)
 
-        result = update.main([], runner=runner, interactive=False)
+            result = update.main(
+                [],
+                script_dir=public,
+                runner=runner,
+                token_provider=lambda *_: "token",
+                sandbox_root=root,
+            )
 
-        self.assertEqual(result, 1)
-        self.assertEqual(runner.commands, [])
-        self.assertIsNone(runner.exec_command)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            runner.exec_command[0],
+            [str(private / "update.sh"), "--version", "latest"],
+        )
 
 
 if __name__ == "__main__":
